@@ -1,0 +1,30 @@
+{
+  "id": "openclaw-widget-bridge",
+  "name": "OpenClaw Widget Bridge",
+  "version": "0.1.0",
+  "description": "Minimal, privacy-safe widget summary API",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "apiToken": {
+        "type": "string",
+        "minLength": 16
+      },
+      "cliPath": {
+        "type": "string",
+        "minLength": 1
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "minimum": 2000,
+        "maximum": 20000
+      },
+      "usageDays": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 90
+      }
+    }
+  }
+}
