@@ -267,7 +267,7 @@ configure_cloudflared_named_tunnel() {
 
   if [[ -f "$config_file" ]] && grep -q '/widget/summary' "$config_file" 2>/dev/null; then
     local existing_hostname=""
-    existing_hostname="$(awk '/hostname:/ {print $2; exit}' "$config_file")"
+    existing_hostname="$(awk '/hostname:/ {print $3; exit}' "$config_file")"
 
     local service_status="unknown"
     if [[ "$(id -u)" -eq 0 ]] && command_exists systemctl; then
