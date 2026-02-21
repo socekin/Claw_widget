@@ -54,11 +54,35 @@ prompt_input() {
   local default_value="$2"
   local value
 
-  read -r -p "$prompt [$default_value]: " value || true
+  read -r -p "$prompt (Enter = $default_value): " value || true
   if [[ -z "${value}" ]]; then
     printf "%s" "$default_value"
   else
     printf "%s" "$value"
+  fi
+}
+
+detect_install_mode() {
+  local install_dir="$1"
+  local has_source="false"
+  local has_config="false"
+
+  if [[ -f "$install_dir/openclaw.plugin.json" ]]; then
+    has_source="true"
+  fi
+
+  local plugin_enabled=""
+  plugin_enabled="$(openclaw config get "plugins.entries.${PLUGIN_ID}.enabled" 2>/dev/null | tr -d '\"[:space:]')" || true
+  if [[ "$plugin_enabled" == "true" ]]; then
+    has_config="true"
+  fi
+
+  if [[ "$has_source" == "true" && "$has_config" == "true" ]]; then
+    printf "update"
+  elif [[ "$has_source" == "false" && "$has_config" == "false" ]]; then
+    printf "fresh"
+  else
+    printf "reconfigure"
   fi
 }
 
@@ -168,9 +192,25 @@ generate_token() {
 
 configure_openclaw_plugin() {
   local install_dir="$1"
+  local mode="${2:-fresh}"
 
   log "Installing plugin in link mode..."
   openclaw plugins install -l "$install_dir"
+
+  if [[ "$mode" == "update" ]]; then
+    local existing_token=""
+    existing_token="$(openclaw config get "plugins.entries.${PLUGIN_ID}.config.apiToken" 2>/dev/null | tr -d '\"[:space:]')" || true
+    local existing_cli=""
+    existing_cli="$(openclaw config get "plugins.entries.${PLUGIN_ID}.config.cliPath" 2>/dev/null | tr -d '\"[:space:]')" || true
+
+    if [[ -n "$existing_token" ]] && [[ -n "$existing_cli" ]] && command_exists "$existing_cli"; then
+      log "Plugin is already configured (token set, cliPath valid)."
+      if ! prompt_yes_no "Reconfigure plugin settings?" "n"; then
+        log "Keeping existing plugin configuration."
+        return 0
+      fi
+    fi
+  fi
 
   local token_value=""
   if [[ -f "$TOKEN_FILE" ]] && [[ -s "$TOKEN_FILE" ]]; then
@@ -218,8 +258,44 @@ configure_cloudflared_named_tunnel() {
     return 1
   fi
 
-  if ! prompt_yes_no "Configure Cloudflare Named Tunnel for a public URL now?" "y"; then
-    return 1
+  local config_file
+  if [[ "$(id -u)" -eq 0 ]]; then
+    config_file="/etc/cloudflared/config.yml"
+  else
+    config_file="$HOME/.cloudflared/config.yml"
+  fi
+
+  if [[ -f "$config_file" ]] && grep -q '/widget/summary' "$config_file" 2>/dev/null; then
+    local existing_hostname=""
+    existing_hostname="$(awk '/hostname:/ {print $2; exit}' "$config_file")"
+
+    local service_status="unknown"
+    if [[ "$(id -u)" -eq 0 ]] && command_exists systemctl; then
+      if systemctl is-active --quiet cloudflared 2>/dev/null; then
+        service_status="running"
+      else
+        service_status="stopped"
+      fi
+    fi
+
+    log "Existing Cloudflare Tunnel detected:"
+    log "  Config:   $config_file"
+    log "  Hostname: ${existing_hostname:-<not found>}"
+    if [[ "$(id -u)" -eq 0 ]]; then
+      log "  Service:  $service_status"
+    fi
+
+    if ! prompt_yes_no "Cloudflare Tunnel is already configured. Reconfigure?" "n"; then
+      if [[ -n "$existing_hostname" ]]; then
+        printf "https://%s/widget/summary" "$existing_hostname"
+        return 0
+      fi
+      warn "Could not extract hostname from existing config. Proceeding with setup."
+    fi
+  else
+    if ! prompt_yes_no "Configure Cloudflare Named Tunnel for a public URL now?" "y"; then
+      return 1
+    fi
   fi
 
   if [[ ! -f "$HOME/.cloudflared/cert.pem" ]]; then
@@ -250,13 +326,6 @@ configure_cloudflared_named_tunnel() {
 
   local credentials_file="$HOME/.cloudflared/${tunnel_id}.json"
   [[ -f "$credentials_file" ]] || warn "Credentials file not found at $credentials_file"
-
-  local config_file
-  if [[ "$(id -u)" -eq 0 ]]; then
-    config_file="/etc/cloudflared/config.yml"
-  else
-    config_file="$HOME/.cloudflared/config.yml"
-  fi
 
   mkdir -p "$(dirname "$config_file")"
   cat > "$config_file" <<YAML
@@ -333,25 +402,31 @@ main() {
   command_exists openclaw || error_exit "openclaw is required but not found in PATH."
   command_exists tar || error_exit "tar is required."
 
-  local repo_url
-  repo_url="$(prompt_input "GitHub repository URL" "$DEFAULT_REPO_URL")"
-  local branch
-  branch="$(prompt_input "Git branch" "$DEFAULT_BRANCH")"
+  local repo_url="$DEFAULT_REPO_URL"
+  local branch="$DEFAULT_BRANCH"
 
   local install_dir
   install_dir="$(prompt_input "Install path" "$DEFAULT_INSTALL_DIR")"
 
+  local mode
+  mode="$(detect_install_mode "$install_dir")"
+
+  case "$mode" in
+    fresh)       log "Detected: fresh installation." ;;
+    update)      log "Detected: existing installation. Running in update mode." ;;
+    reconfigure) log "Detected: partial installation. Running in reconfigure mode." ;;
+  esac
+
   log "Install path: $install_dir"
-  if ! prompt_yes_no "Continue installation with this path?" "y"; then
+  if ! prompt_yes_no "Continue?" "y"; then
     error_exit "Installation aborted by user."
   fi
 
   sync_source "$repo_url" "$branch" "$install_dir"
-  configure_openclaw_plugin "$install_dir"
+  configure_openclaw_plugin "$install_dir" "$mode"
 
   local local_port
-  local local_port_default="$DEFAULT_GATEWAY_PORT"
-  local_port="$(prompt_input "Gateway port" "$local_port_default")"
+  local_port="$(prompt_input "Gateway port" "$DEFAULT_GATEWAY_PORT")"
   local local_url="http://127.0.0.1:${local_port}/widget/summary"
 
   local public_url=""
