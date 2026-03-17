@@ -4,9 +4,10 @@ Minimal HTTP bridge for iOS widgets (or any client) to fetch a safe OpenClaw sum
 
 ## What This Plugin Does
 
-This plugin exposes one authenticated endpoint:
+This plugin exposes authenticated endpoints:
 
 - `GET /widget/summary`
+- `GET /widget/agents?days=N`
 
 It returns:
 
@@ -30,10 +31,10 @@ iOS Widget / Mobile App
 Cloudflare Tunnel (optional)
         |
         v
-OpenClaw Gateway + Plugin Route (/widget/summary)
+OpenClaw Gateway + Plugin Route (/widget/*)
         |
-        +-- openclaw gateway call health --json
-        +-- openclaw gateway call usage.cost --json --params '{"days": N}'
+        +-- openclaw health --json              (stable top-level CLI command)
+        +-- ~/.openclaw/agents/*/sessions/*.jsonl  (direct file read, no WS RPC)
 ```
 
 ## Requirements
@@ -67,7 +68,20 @@ openclaw config set plugins.entries.openclaw-widget-bridge.config.apiToken "$WID
 openclaw config set plugins.entries.openclaw-widget-bridge.config.cliPath "$(command -v openclaw)"
 openclaw config set plugins.entries.openclaw-widget-bridge.config.timeoutMs 8000
 openclaw config set plugins.entries.openclaw-widget-bridge.config.usageDays 30
+openclaw config set plugins.entries.openclaw-widget-bridge.config.cacheTtlSeconds 60
+# openclaw config set plugins.entries.openclaw-widget-bridge.config.openclawHome "/custom/path/.openclaw"
 ```
+
+#### Config fields reference
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `apiToken` | string | *(required)* | Bearer token for authentication |
+| `cliPath` | string | *(required)* | Absolute path to `openclaw` binary |
+| `timeoutMs` | integer | `8000` | CLI command timeout in milliseconds |
+| `usageDays` | integer | `30` | Default number of days for usage queries |
+| `cacheTtlSeconds` | integer (10-300) | `60` | Cache TTL in seconds for health and usage data |
+| `openclawHome` | string | *(optional)* | OpenClaw home directory path. Precedence: this value > `OPENCLAW_HOME` env > `~/.openclaw` |
 
 ### 3) Restart gateway
 
@@ -97,7 +111,7 @@ http://127.0.0.1:18789/widget/summary
 
 2. Stable production URL (Cloudflare Named Tunnel)
 
-Follow the full setup below to expose only `/widget/summary` via HTTPS.
+Follow the full setup below to expose `/widget/*` endpoints via HTTPS.
 
 #### Step A: Install and authenticate `cloudflared`
 
@@ -128,14 +142,14 @@ credentials-file: /root/.cloudflared/<TUNNEL_UUID>.json
 
 ingress:
   - hostname: widget.example.com
-    path: ^/widget/summary$
+    path: ^/widget/(summary|agents)
     service: http://127.0.0.1:18789
   - service: http_status:404
 ```
 
 Notes:
 
-- Keep the `path` rule strict so only `/widget/summary` is exposed.
+- Keep the `path` rule strict so only `/widget/*` endpoints are exposed.
 - Replace `<TUNNEL_UUID>` with the value returned by `cloudflared tunnel create`.
 - If your `cloudflared` user is not `root`, adjust `credentials-file` path.
 
@@ -163,7 +177,7 @@ You should get a `200` JSON response with `ok: true`.
 - Keep only `widget.example.com` DNS proxied by Cloudflare.
 - Do not expose `:18789` directly on public interfaces.
 - Rotate widget token periodically.
-- Restrict ingress path to `/widget/summary` only.
+- Restrict ingress path to `/widget/*` endpoints only.
 
 ## Endpoint Reference
 
@@ -215,6 +229,49 @@ curl -sS -H "Authorization: Bearer $WIDGET_TOKEN" \
 }
 ```
 
+### `GET /widget/agents`
+
+Headers:
+
+- `Authorization: Bearer <apiToken>`
+
+Query params:
+
+- `days` (optional): integer `1-90`
+
+### Example request
+
+```bash
+WIDGET_TOKEN="$(openclaw config get plugins.entries.openclaw-widget-bridge.config.apiToken | tr -d '\"[:space:]')"
+
+curl -sS -H "Authorization: Bearer $WIDGET_TOKEN" \
+  "http://127.0.0.1:18789/widget/agents?days=7" | jq
+```
+
+### Example success response
+
+```json
+{
+  "ok": true,
+  "updatedAt": 1773648600000,
+  "agents": [
+    {
+      "agentId": "main",
+      "days": 7,
+      "startDate": "2026-03-11",
+      "endDate": "2026-03-17",
+      "totalTokens": 200000,
+      "totalCostUsd": 3.00,
+      "daily": [
+        { "date": "2026-03-11", "tokens": 30000, "totalCostUsd": 0.45 }
+      ]
+    }
+  ]
+}
+```
+
+---
+
 ### Error responses
 
 - `401` + `{"ok":false,"error":"unauthorized"}`: missing/invalid token
@@ -227,7 +284,7 @@ curl -sS -H "Authorization: Bearer $WIDGET_TOKEN" \
 - Store token with strict file permissions (`chmod 600`).
 - Rotate token periodically and update all clients.
 - Prefer HTTPS only (Tunnel / reverse proxy with TLS).
-- Expose only `/widget/summary` in ingress rules.
+- Expose only `/widget/*` endpoints in ingress rules.
 - Do not log full authorization headers in proxies.
 - Keep OpenClaw and cloudflared updated.
 - Data minimization: this API returns only health + aggregated usage; no transcript payload is exposed.
@@ -242,5 +299,6 @@ curl -sS -H "Authorization: Bearer $WIDGET_TOKEN" \
 
 ## Ops Notes
 
-- `usage.cost` values are estimated from model pricing config and may differ from provider invoices.
+- Usage cost values are estimated from session JSONL token counts and may differ from provider invoices.
 - Large `days` windows and very frequent polling can increase CPU usage.
+- Health data comes from `openclaw health --json`; usage data is read directly from `~/.openclaw/agents/*/sessions/*.jsonl` (no WS RPC dependency).

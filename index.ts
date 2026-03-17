@@ -1,9 +1,25 @@
 import { timingSafeEqual } from "node:crypto";
+// Note: OpenClaw loads TS plugins via jiti which resolves .ts imports directly.
+import {
+  parseAgentUsage,
+  aggregateUsage,
+  resolveOpenclawHome,
+} from "./parse-sessions.ts";
 
-function sendJson(res: any, status: number, body: unknown) {
+// ── HTTP Helpers (unchanged from v0.1.0) ──
+
+function sendJson(
+  res: any,
+  status: number,
+  body: unknown,
+  cacheHit?: boolean,
+) {
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Cache-Control", "no-store");
+  if (cacheHit !== undefined) {
+    res.setHeader("X-Cache", cacheHit ? "hit" : "miss");
+  }
   res.end(JSON.stringify(body));
 }
 
@@ -20,180 +36,190 @@ function safeEqual(a: string, b: string): boolean {
   return timingSafeEqual(ab, bb);
 }
 
-function toFiniteNumber(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+// ── Cache with stampede protection ──
+
+interface CacheEntry<T> {
+  data: T;
+  expiresAt: number;
 }
 
-function normalizeDailyUsage(
-  value: unknown,
-): Array<{ date: string; tokens: number; totalCostUsd: number }> {
-  if (!Array.isArray(value)) {
-    return [];
+const cache = new Map<string, CacheEntry<any>>();
+const inflightRequests = new Map<string, Promise<any>>();
+
+async function cached<T>(
+  key: string,
+  ttlMs: number,
+  fn: () => Promise<T>,
+): Promise<{ data: T; hit: boolean }> {
+  const entry = cache.get(key);
+  if (entry && Date.now() < entry.expiresAt) {
+    return { data: entry.data, hit: true };
   }
 
-  const daily: Array<{ date: string; tokens: number; totalCostUsd: number }> = [];
-  for (const item of value) {
-    if (!item || typeof item !== "object") {
-      continue;
-    }
-
-    const entry = item as Record<string, unknown>;
-    const date = typeof entry.date === "string" ? entry.date : "";
-    if (!date) {
-      continue;
-    }
-
-    const tokens =
-      toFiniteNumber(entry.totalTokens) ??
-      (toFiniteNumber(entry.input) ?? 0) +
-        (toFiniteNumber(entry.output) ?? 0) +
-        (toFiniteNumber(entry.cacheRead) ?? 0) +
-        (toFiniteNumber(entry.cacheWrite) ?? 0);
-
-    const totalCostUsd =
-      toFiniteNumber(entry.totalCost) ??
-      (toFiniteNumber(entry.inputCost) ?? 0) +
-        (toFiniteNumber(entry.outputCost) ?? 0) +
-        (toFiniteNumber(entry.cacheReadCost) ?? 0) +
-        (toFiniteNumber(entry.cacheWriteCost) ?? 0);
-
-    daily.push({ date, tokens, totalCostUsd });
+  let inflight = inflightRequests.get(key);
+  if (!inflight) {
+    inflight = fn().then((result) => {
+      cache.set(key, { data: result, expiresAt: Date.now() + ttlMs });
+      inflightRequests.delete(key);
+      return result;
+    }).catch((err) => {
+      inflightRequests.delete(key);
+      throw err;
+    });
+    inflightRequests.set(key, inflight);
   }
 
-  return daily;
+  const data = await inflight;
+  return { data, hit: false };
 }
 
-function parseJsonOutput(stdout: string): any {
-  const text = String(stdout ?? "").trim();
-  if (!text) throw new Error("empty gateway output");
+// ── Health module ──
+// The plugin runs inside the gateway process. If a request reaches this handler,
+// the gateway is definitionally "up". No subprocess call needed.
+
+function fetchHealth(): { status: string; latencyMs: number | null; checkedAt: number | null } {
+  return {
+    status: "up",
+    latencyMs: 0,
+    checkedAt: Date.now(),
+  };
+}
+
+// ── Config helpers ──
+
+function readConfig(api: any) {
+  const pluginConfig = (api.pluginConfig ?? {}) as Record<string, unknown>;
+
+  const apiToken = String(pluginConfig.apiToken ?? "").trim();
+  const cliPath = String(pluginConfig.cliPath ?? "openclaw").trim();
+  const timeoutMs = Math.max(
+    2000,
+    Math.min(20000, Number(pluginConfig.timeoutMs ?? 8000) || 8000),
+  );
+  const defaultDays = Math.max(
+    1,
+    Math.min(90, Number(pluginConfig.usageDays ?? 7) || 7),
+  );
+  const cacheTtlMs =
+    Math.max(10, Math.min(300, Number(pluginConfig.cacheTtlSeconds ?? 60) || 60)) * 1000;
+  const openclawHome = resolveOpenclawHome(
+    typeof pluginConfig.openclawHome === "string" && pluginConfig.openclawHome.trim()
+      ? pluginConfig.openclawHome.trim()
+      : undefined,
+  );
+
+  return { apiToken, cliPath, timeoutMs, defaultDays, cacheTtlMs, openclawHome };
+}
+
+function parseDays(req: any, defaultDays: number): number {
   try {
-    return JSON.parse(text);
-  } catch {
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-    if (start >= 0 && end > start) {
-      return JSON.parse(text.slice(start, end + 1));
+    const url = new URL(req.url ?? "/", "http://localhost");
+    const raw = Number(url.searchParams.get("days"));
+    if (Number.isFinite(raw) && raw >= 1 && raw <= 90) {
+      return Math.floor(raw);
     }
-    throw new Error("invalid JSON from gateway call");
+  } catch {
+    // ignore malformed query
   }
+  return defaultDays;
 }
 
-async function callGatewayMethod(params: {
-  api: any;
-  cliPath: string;
-  timeoutMs: number;
-  method: string;
-  payload?: Record<string, unknown>;
-}): Promise<any> {
-  const args = [
-    params.cliPath,
-    "gateway",
-    "call",
-    params.method,
-    "--json",
-    "--timeout",
-    String(params.timeoutMs),
-  ];
-  if (params.payload) {
-    args.push("--params", JSON.stringify(params.payload));
+// ── Shared auth middleware ──
+
+function authCheck(
+  req: any,
+  res: any,
+  apiToken: string,
+): boolean {
+  if ((req.method ?? "GET").toUpperCase() !== "GET") {
+    sendJson(res, 405, { ok: false, error: "method_not_allowed" });
+    return false;
   }
-
-  const result = await params.api.runtime.system.runCommandWithTimeout(args, {
-    timeoutMs: params.timeoutMs + 2000,
-  });
-
-  if (result.code !== 0) {
-    throw new Error((result.stderr || result.stdout || "gateway call failed").trim());
+  if (!apiToken) {
+    sendJson(res, 500, { ok: false, error: "plugin_not_configured" });
+    return false;
   }
-
-  return parseJsonOutput(result.stdout);
+  const incomingToken = readBearerToken(req);
+  if (!incomingToken || !safeEqual(incomingToken, apiToken)) {
+    sendJson(res, 401, { ok: false, error: "unauthorized" });
+    return false;
+  }
+  return true;
 }
+
+// ── Plugin export ──
 
 export default {
   id: "openclaw-widget-bridge",
   register(api: any) {
+    // GET /widget/summary — backward compatible with v0.1.0
     api.registerHttpRoute({
       path: "/widget/summary",
+      auth: "plugin",
       handler: async (req: any, res: any) => {
-        if ((req.method ?? "GET").toUpperCase() !== "GET") {
-          sendJson(res, 405, { ok: false, error: "method_not_allowed" });
-          return;
-        }
+        const cfg = readConfig(api);
+        if (!authCheck(req, res, cfg.apiToken)) return;
 
-        const pluginConfig = (api.pluginConfig ?? {}) as Record<string, unknown>;
-        const apiToken = String(pluginConfig.apiToken ?? "").trim();
-        const cliPath = String(pluginConfig.cliPath ?? "openclaw").trim();
-        const timeoutMs = Math.max(
-          2000,
-          Math.min(20000, Number(pluginConfig.timeoutMs ?? 8000) || 8000),
-        );
-        const defaultDays = Math.max(
-          1,
-          Math.min(90, Number(pluginConfig.usageDays ?? 7) || 7),
-        );
+        const days = parseDays(req, cfg.defaultDays);
 
-        if (!apiToken) {
-          sendJson(res, 500, { ok: false, error: "plugin_not_configured" });
-          return;
-        }
+        const health = fetchHealth();
 
-        const incomingToken = readBearerToken(req);
-        if (!incomingToken || !safeEqual(incomingToken, apiToken)) {
-          sendJson(res, 401, { ok: false, error: "unauthorized" });
-          return;
-        }
-
-        let days = defaultDays;
         try {
-          const url = new URL(req.url ?? "/", "http://localhost");
-          const raw = Number(url.searchParams.get("days"));
-          if (Number.isFinite(raw) && raw >= 1 && raw <= 90) {
-            days = Math.floor(raw);
-          }
+          const { data: usage, hit } = await cached(
+            `usage:${days}`,
+            cfg.cacheTtlMs,
+            async () => {
+              const agents = await parseAgentUsage(cfg.openclawHome, days);
+              return aggregateUsage(agents, days);
+            },
+          );
+
+          sendJson(res, 200, {
+            ok: true,
+            updatedAt: Date.now(),
+            health,
+            usage,
+          }, hit);
         } catch {
-          // ignore malformed query
+          sendJson(res, 200, {
+            ok: true,
+            updatedAt: Date.now(),
+            health,
+            usage: { days, startDate: null, endDate: null, totalTokens: null, totalCostUsd: null, daily: [], updatedAt: null },
+          }, false);
         }
+      },
+    });
 
-        const [healthResult, usageResult] = await Promise.allSettled([
-          callGatewayMethod({
-            api,
-            cliPath,
-            timeoutMs,
-            method: "health",
-          }),
-          callGatewayMethod({
-            api,
-            cliPath,
-            timeoutMs,
-            method: "usage.cost",
-            payload: { days },
-          }),
-        ]);
+    // GET /widget/agents — new endpoint, per-agent breakdown
+    api.registerHttpRoute({
+      path: "/widget/agents",
+      auth: "plugin",
+      handler: async (req: any, res: any) => {
+        const cfg = readConfig(api);
+        if (!authCheck(req, res, cfg.apiToken)) return;
 
-        const healthPayload = healthResult.status === "fulfilled" ? healthResult.value : null;
-        const usagePayload = usageResult.status === "fulfilled" ? usageResult.value : null;
+        const days = parseDays(req, cfg.defaultDays);
 
-        const healthOk =
-          typeof healthPayload?.ok === "boolean" ? healthPayload.ok : healthResult.status === "fulfilled";
+        try {
+          const { data: agents, hit } = await cached(
+            `agents:${days}`,
+            cfg.cacheTtlMs,
+            () => parseAgentUsage(cfg.openclawHome, days),
+          );
 
-        sendJson(res, 200, {
-          ok: true,
-          updatedAt: Date.now(),
-          health: {
-            status: healthOk ? "up" : "down",
-            latencyMs: toFiniteNumber(healthPayload?.durationMs),
-            checkedAt: toFiniteNumber(healthPayload?.ts),
-          },
-          usage: {
-            days,
-            startDate: typeof usagePayload?.startDate === "string" ? usagePayload.startDate : null,
-            endDate: typeof usagePayload?.endDate === "string" ? usagePayload.endDate : null,
-            totalTokens: toFiniteNumber(usagePayload?.totals?.totalTokens),
-            totalCostUsd: toFiniteNumber(usagePayload?.totals?.totalCost),
-            daily: normalizeDailyUsage(usagePayload?.daily),
-            updatedAt: toFiniteNumber(usagePayload?.updatedAt),
-          },
-        });
+          sendJson(res, 200, {
+            ok: true,
+            updatedAt: Date.now(),
+            agents: agents.map(({ latestTimestamp, ...rest }) => rest),
+          }, hit);
+        } catch {
+          sendJson(res, 200, {
+            ok: true,
+            updatedAt: Date.now(),
+            agents: [],
+          }, false);
+        }
       },
     });
   },

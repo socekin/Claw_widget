@@ -203,8 +203,23 @@ configure_openclaw_plugin() {
     local existing_cli=""
     existing_cli="$(openclaw config get "plugins.entries.${PLUGIN_ID}.config.cliPath" 2>/dev/null | tr -d '\"[:space:]')" || true
 
-    if [[ -n "$existing_token" ]] && [[ -n "$existing_cli" ]] && command_exists "$existing_cli"; then
+    # openclaw config get may return __OPENCLAW_REDACTED__ for sensitive fields;
+    # also check token file to confirm token is actually set
+    local token_exists="false"
+    if [[ -n "$existing_token" ]] && [[ "$existing_token" != "__OPENCLAW_REDACTED__" ]]; then
+      token_exists="true"
+    elif [[ -f "$TOKEN_FILE" ]] && [[ -s "$TOKEN_FILE" ]]; then
+      token_exists="true"
+    fi
+    if [[ "$token_exists" == "true" ]] && [[ -n "$existing_cli" ]] && command_exists "$existing_cli"; then
       log "Plugin is already configured (token set, cliPath valid)."
+      # Ensure new config fields from v0.2.0 are set even when not reconfiguring
+      local existing_cache_ttl=""
+      existing_cache_ttl="$(openclaw config get "plugins.entries.${PLUGIN_ID}.config.cacheTtlSeconds" 2>/dev/null | tr -d '\"[:space:]')" || true
+      if [[ -z "$existing_cache_ttl" ]] || [[ "$existing_cache_ttl" == "null" ]]; then
+        log "Setting new v0.2.0 config field: cacheTtlSeconds=60"
+        openclaw config set "plugins.entries.${PLUGIN_ID}.config.cacheTtlSeconds" 60
+      fi
       if ! prompt_yes_no "Reconfigure plugin settings?" "n"; then
         log "Keeping existing plugin configuration."
         return 0
@@ -242,6 +257,7 @@ configure_openclaw_plugin() {
   openclaw config set "plugins.entries.${PLUGIN_ID}.config.cliPath" "$cli_path"
   openclaw config set "plugins.entries.${PLUGIN_ID}.config.timeoutMs" 8000
   openclaw config set "plugins.entries.${PLUGIN_ID}.config.usageDays" 30
+  openclaw config set "plugins.entries.${PLUGIN_ID}.config.cacheTtlSeconds" 60
 }
 
 extract_tunnel_id() {
@@ -265,7 +281,7 @@ configure_cloudflared_named_tunnel() {
     config_file="$HOME/.cloudflared/config.yml"
   fi
 
-  if [[ -f "$config_file" ]] && grep -q '/widget/summary' "$config_file" 2>/dev/null; then
+  if [[ -f "$config_file" ]] && grep -q '/widget/' "$config_file" 2>/dev/null; then
     local existing_hostname=""
     existing_hostname="$(awk '/hostname:/ {print $3; exit}' "$config_file")"
 
@@ -283,6 +299,16 @@ configure_cloudflared_named_tunnel() {
     log "  Hostname: ${existing_hostname:-<not found>}"
     if [[ "$(id -u)" -eq 0 ]]; then
       log "  Service:  $service_status"
+    fi
+
+    # Auto-update old v0.1.0 tunnel regex to include /widget/agents
+    if grep -q '\^/widget/summary\$' "$config_file" 2>/dev/null; then
+      log "Updating tunnel ingress path to include /widget/agents endpoint..."
+      sed -i 's|\^/widget/summary\$|\^/widget/(summary|agents)\$|g' "$config_file"
+      log "Updated: $config_file"
+      if [[ "$(id -u)" -eq 0 ]] && command_exists systemctl; then
+        systemctl restart cloudflared 2>/dev/null || warn "Failed to restart cloudflared."
+      fi
     fi
 
     if ! prompt_yes_no "Cloudflare Tunnel is already configured. Reconfigure?" "n"; then
@@ -334,7 +360,7 @@ credentials-file: ${credentials_file}
 
 ingress:
   - hostname: ${hostname}
-    path: ^/widget/summary$
+    path: ^/widget/(summary|agents)$
     service: http://127.0.0.1:${local_port}
   - service: http_status:404
 YAML
@@ -375,7 +401,11 @@ print_summary() {
   local public_url="$2"
 
   local token
-  token="$(openclaw config get "plugins.entries.${PLUGIN_ID}.config.apiToken" | tr -d '\"[:space:]')"
+  if [[ -f "$TOKEN_FILE" ]] && [[ -s "$TOKEN_FILE" ]]; then
+    token="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+  else
+    token="<token not found — check $TOKEN_FILE>"
+  fi
 
   echo
   echo "=============================================="
